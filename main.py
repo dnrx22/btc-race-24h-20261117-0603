@@ -1,405 +1,433 @@
-"""Long-only dip-bounce bot for CBBTC, protocol agent-fun/bars-replay/v1.
+#!/usr/bin/env python3
+"""Dip-bounce long-only bot for CBBTC on make.fun, protocol agent-fun/bars-replay/v1.
 
-Strategy (exact integer math only, cross-multiplication, never floats):
-  bars are 1 minute. Keep the closes. After 150 closes, buy when the
-  close is at least 1.5% below the trailing 150-bar high AND this bar
-  closed up on the previous bar (dip-bounce). Size is the smaller of
-  cash and the weight room implied by max_weight_bps. Exit the whole
-  position on take-profit +0.6%, stop-loss -1.5%, a trailing exit
-  (armed at +0.5%, fires after a 0.5% giveback from the peak), or a
-  180-bar max hold, with a 5-bar cooldown after each exit.
+Strategy (exact integer math only, no floats anywhere):
+  * 1-minute bars. Track the last closes of CBBTC.
+  * BUY when the close is at least 1.5% below the trailing high of the
+    previous 150 closes AND the bar closed up on the previous bar
+    (a dip followed by a bounce). One open position at most.
+  * SELL the full position on take-profit +0.6%, stop-loss -1.5%, a
+    trailing exit (armed at +0.5% from entry, fires after a 0.5%
+    giveback from the peak close), or a 180-bar max hold.
+  * 5-bar cooldown after an exit; a buy whose fill never shows up
+    within 2 bars is treated as missed and a fresh buy is allowed.
 
-Wire rule that matters most: the harness sends every u64 amount as a
-JSON int OR as a decimal string (for example "100000000"). Every
-amount in the stream is therefore parsed through to_u64, which
-accepts both forms and rejects anything else. A value is never
-rejected merely for being a string. Bar depth fields (o_depth /
-c_depth) are ignored entirely; the bot never uses pool depth.
-
-Deterministic, standard library only: no clock, no environment, no
-unseeded randomness. Two runs on the same input produce byte-identical
-replies. stdin is JSON lines, stdout carries exactly one compact JSON
-reply line per batch, diagnostics go to stderr.
+Wire rules this file implements:
+  * INPUT u64 values may arrive as JSON ints OR as decimal strings
+    (e.g. "1000000000"). A single helper, to_u64(), accepts both and
+    rejects anything else as a fatal protocol error.
+  * *** REPLY AMOUNTS MUST BE DECIMAL STRINGS ***: in every reply,
+    notional_quote_units (buy) and qty (sell) are emitted as decimal
+    strings, e.g. "1000000000", never as JSON numbers. The harness
+    rejects an int amount as a protocol violation and fails the run.
+    seq stays a JSON int and max_slippage_bps stays a JSON int.
+  * Deterministic: no clock, no environment, no unseeded randomness,
+    no floats. Two runs on the same input produce byte-identical
+    replies. Standard library only, single file, no local imports.
 """
 
 import json
 import re
 import sys
 
-U64_MAX = 2 ** 64 - 1
-U64_STR_RE = re.compile(r"(0|[1-9][0-9]{0,19})")
-SYMBOL_RE = re.compile(r"[A-Z0-9]{1,20}")
-CLIENT_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-
-SYMBOL = "CBBTC"
 PROTOCOL = "agent-fun/bars-replay/v1"
+SYMBOL = "CBBTC"
 
+# Strategy constants.
 LOOKBACK = 150
-DIP_BPS = 9850          # buy when close <= high * 9850 / 10000 (-1.5%)
-TAKE_PROFIT_BPS = 10060  # exit when close >= entry * 10060 / 10000 (+0.6%)
-STOP_LOSS_BPS = 9850    # exit when close <= entry * 9850 / 10000 (-1.5%)
-TRAIL_ARM_BPS = 10050    # trailing armed when peak >= entry * 10050 / 10000
-TRAIL_GIVEBACK_BPS = 9950  # trailing fires when close <= peak * 9950 / 10000
+DIP_BPS = 9850            # buy at >= 1.5% below trailing high
+TAKE_PROFIT_BPS = 10060   # +0.6%
+STOP_LOSS_BPS = 9850      # -1.5%
+TRAIL_ARM_BPS = 10050     # +0.5%
+TRAIL_GIVEBACK_BPS = 9950  # 0.5% giveback from peak
 MAX_HOLD_BARS = 180
 COOLDOWN_BARS = 5
+MISSED_FILL_BARS = 2
 MAX_SLIPPAGE_BPS = 300
+
+_U64_RE = re.compile(r"(?:0|[1-9][0-9]{0,19})")
+_SYMBOL_RE = re.compile(r"[A-Z0-9]{1,20}")
+_CLIENT_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_MAX_U64 = 2 ** 64 - 1
+
+
+class Fatal(Exception):
+    """A protocol violation: print to stderr and exit nonzero."""
 
 
 def fail(message):
-    print("error: " + message, file=sys.stderr)
-    raise SystemExit(1)
+    raise Fatal(message)
 
 
-def to_u64(value):
-    """Parse a u64 that may arrive as a JSON int or a decimal string.
+def to_u64(value, field):
+    """Accept a u64 as a JSON int or as a decimal string; else fatal.
 
-    Accepts a real int (not a bool) or a string matching 0 or
-    [1-9][0-9]{0,19}; the result must lie in 0..2**64-1. Anything else
-    (float, bool, None, a malformed string, out of range) is fatal.
+    Accepts a real int (not bool) or a string matching 0 or
+    [1-9][0-9]{0,19}. Rejects floats, bools, negative or over-long
+    strings, leading-zero strings such as "007", and anything outside
+    0..2**64-1. Never rejects a value merely for being a string.
     """
     if isinstance(value, bool):
-        fail("u64 value must not be a bool")
-    if isinstance(value, int):
-        if 0 <= value <= U64_MAX:
-            return value
-        fail("u64 value out of range")
-    if isinstance(value, str):
-        if U64_STR_RE.fullmatch(value) is None:
-            fail("u64 string is not a canonical decimal integer")
-        number = int(value)
-        if 0 <= number <= U64_MAX:
-            return number
-        fail("u64 value out of range")
-    fail("u64 value must be an int or a decimal string")
-
-
-def to_scale(value, name):
-    """Parse a small scale (quote/qty/price scale): int or digit string."""
-    if isinstance(value, bool):
-        fail(name + " must not be a bool")
+        fail("field %s: bool is not a u64" % field)
     if isinstance(value, int):
         number = value
     elif isinstance(value, str):
-        if value == "" or not value.isdigit():
-            fail(name + " is not a decimal integer")
+        if _U64_RE.fullmatch(value) is None:
+            fail("field %s: not a decimal u64 string: %r" % (field, value))
         number = int(value)
     else:
-        fail(name + " must be an int or a decimal string")
-    if 0 <= number <= 30:
-        return number
-    fail(name + " out of range")
+        fail("field %s: not an int or decimal string" % field)
+    if number < 0 or number > _MAX_U64:
+        fail("field %s: u64 out of range" % field)
+    return number
 
 
-def check_symbol(value):
-    if not isinstance(value, str):
-        fail("symbol must be a string")
-    if SYMBOL_RE.fullmatch(value) is None:
-        fail("symbol does not match [A-Z0-9]{1,20}")
+def to_plain_int(value, field, minimum=None, maximum=None):
+    """Accept a plain JSON int (not bool, not string) within bounds."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail("field %s: not a plain int" % field)
+    if minimum is not None and value < minimum:
+        fail("field %s: below minimum %d" % (field, minimum))
+    if maximum is not None and value > maximum:
+        fail("field %s: above maximum %d" % (field, maximum))
     return value
 
 
-def position_value(qty, price, quote_scale, qty_scale, price_scale):
-    """Value of qty units at price, in quote units (integer math)."""
-    return qty * price * 10 ** quote_scale // 10 ** (qty_scale + price_scale)
+def check_symbol(value, field):
+    if not isinstance(value, str) or _SYMBOL_RE.fullmatch(value) is None:
+        fail("field %s: bad symbol %r" % (field, value))
+    return value
 
 
-def parse_account(raw):
-    """Parse an account object; returns (cash, equity, {symbol: (qty, cost)})."""
+def check_client_id(value):
+    if not isinstance(value, str):
+        fail("client_id is not a string")
+    if _CLIENT_RE.fullmatch(value) is None or value.startswith("_"):
+        fail("bad client_id %r" % (value,))
+    return value
+
+
+def check_account(raw, field):
+    """Validate an account block; return (cash, equity, positions)."""
     if not isinstance(raw, dict):
-        fail("account must be an object")
-    if "cash_quote_units" not in raw or "equity_quote_units" not in raw:
-        fail("account is missing cash or equity")
-    cash = to_u64(raw["cash_quote_units"])
-    equity = to_u64(raw["equity_quote_units"])
-    positions = {}
-    raw_positions = raw.get("positions", [])
-    if not isinstance(raw_positions, list):
-        fail("account positions must be a list")
-    for item in raw_positions:
-        if not isinstance(item, dict):
-            fail("position must be an object")
-        if "symbol" not in item or "qty" not in item:
-            fail("position is missing symbol or qty")
-        if "cost_quote_units" not in item:
-            fail("position is missing cost_quote_units")
-        symbol = check_symbol(item["symbol"])
-        qty = to_u64(item["qty"])
-        cost = to_u64(item["cost_quote_units"])
-        positions[symbol] = (qty, cost)
-    return cash, equity, positions
+        fail("field %s: account is not an object" % field)
+    cash = to_u64(raw.get("cash_quote_units"), field + ".cash_quote_units")
+    equity = to_u64(raw.get("equity_quote_units"), field + ".equity_quote_units")
+    positions = raw.get("positions")
+    if not isinstance(positions, list):
+        fail("field %s: positions is not a list" % field)
+    parsed = []
+    for position in positions:
+        if not isinstance(position, dict):
+            fail("field %s: position is not an object" % field)
+        symbol = check_symbol(position.get("symbol"), field + ".positions.symbol")
+        qty = to_u64(position.get("qty"), field + ".positions.qty")
+        cost = to_u64(position.get("cost_quote_units"),
+                      field + ".positions.cost_quote_units")
+        parsed.append((symbol, qty, cost))
+    return cash, equity, parsed
 
 
-def main():
-    hello_seen = False
-    done_seen = False
-    quote_scale = 0
-    qty_scale = 0
-    price_scale = 0
-    max_orders_per_bar = 0
-    max_weight_bps = 0
-    min_notional = 0
-    warmup_bars = 0
+class Bot:
+    def __init__(self, hello):
+        capital = hello.get("capital")
+        if not isinstance(capital, dict):
+            fail("hello.capital is not an object")
+        if not isinstance(capital.get("quote"), str):
+            fail("hello.capital.quote is not a string")
+        self.quote_scale = to_plain_int(capital.get("quote_scale"),
+                                        "hello.capital.quote_scale", 0, 18)
+        # Validated for shape; the bot sizes from per-batch account data.
+        to_u64(capital.get("quote_units"), "hello.capital.quote_units")
 
+        raw_symbols = hello.get("symbols")
+        if not isinstance(raw_symbols, list) or not raw_symbols:
+            fail("hello.symbols is not a non-empty list")
+        self.scales = {}
+        for entry in raw_symbols:
+            if not isinstance(entry, dict):
+                fail("hello.symbols entry is not an object")
+            symbol = check_symbol(entry.get("symbol"), "hello.symbols.symbol")
+            price_scale = to_plain_int(entry.get("price_scale"),
+                                       "hello.symbols.price_scale", 0, 18)
+            qty_scale = to_plain_int(entry.get("qty_scale"),
+                                     "hello.symbols.qty_scale", 0, 18)
+            self.scales[symbol] = (price_scale, qty_scale)
+        # Fallbacks only if the harness ever omits CBBTC from symbols.
+        self.price_scale, self.qty_scale = self.scales.get(SYMBOL, (5, 8))
+
+        caps = hello.get("caps")
+        if not isinstance(caps, dict):
+            fail("hello.caps is not an object")
+        self.max_open_positions = to_plain_int(
+            caps.get("max_open_positions"), "hello.caps.max_open_positions", 0)
+        self.max_orders_per_bar = to_plain_int(
+            caps.get("max_orders_per_bar"), "hello.caps.max_orders_per_bar", 0)
+        self.max_weight_bps = to_plain_int(
+            caps.get("max_weight_bps"), "hello.caps.max_weight_bps", 0, 10000)
+        if not isinstance(caps.get("shorts"), bool):
+            fail("hello.caps.shorts is not a bool")
+        if not isinstance(caps.get("leverage"), bool):
+            fail("hello.caps.leverage is not a bool")
+
+        fees = hello.get("fees")
+        if not isinstance(fees, dict):
+            fail("hello.fees is not an object")
+        to_plain_int(fees.get("fee_bps"), "hello.fees.fee_bps", 0)
+        to_plain_int(fees.get("slippage_bps"), "hello.fees.slippage_bps", 0)
+        self.min_notional = to_u64(fees.get("min_notional_quote_units"),
+                                   "hello.fees.min_notional_quote_units")
+
+        if "warmup_bars" in hello and hello.get("warmup_bars") is not None:
+            self.warmup_bars = to_u64(hello.get("warmup_bars"),
+                                      "hello.warmup_bars")
+        else:
+            self.warmup_bars = 0
+
+        # Strategy state.
+        self.closes = []          # CBBTC closes, oldest first
+        self.latest_close = {}    # symbol -> latest close int
+        self.entry = None         # entry price (price_scale ints)
+        self.peak = None          # highest close since entry
+        self.entry_seq = None
+        self.last_exit_seq = -(10 ** 9)
+        self.awaiting_fill = False
+        self.buy_sent_seq = None
+        self.order_counter = 0
+
+    def close(self, symbol):
+        return self.latest_close.get(symbol)
+
+    def value(self, symbol, qty, price):
+        """Position value in quote units at the given price."""
+        if qty <= 0 or price is None:
+            return 0
+        price_scale, qty_scale = self.scales.get(symbol, (5, 8))
+        return (qty * price * (10 ** self.quote_scale)
+                // (10 ** (qty_scale + price_scale)))
+
+    def weight_room(self, symbol):
+        """Remaining buy room in quote units under the weight cap."""
+        held_qty = self.held_qty
+        price = self.close(symbol)
+        held_value = self.value(symbol, held_qty, price)
+        room = self.max_weight_bps * self.equity // 10000 - held_value
+        return room if room > 0 else 0
+
+    def fill_price(self, qty, cost):
+        """True per-unit fill price from cost basis, in price-scale ints."""
+        return (cost * (10 ** (self.qty_scale + self.price_scale))
+                // (qty * (10 ** self.quote_scale)))
+
+    def next_client_id(self):
+        self.order_counter += 1
+        client_id = "o%d" % self.order_counter
+        return check_client_id(client_id)
+
+    def buy_order(self, notional):
+        # *** ROUND-4 FIX: amounts are decimal STRINGS in replies. ***
+        return {"side": "buy",
+                "client_id": self.next_client_id(),
+                "symbol": SYMBOL,
+                "notional_quote_units": str(notional),
+                "max_slippage_bps": MAX_SLIPPAGE_BPS}
+
+    def sell_order(self, qty):
+        # *** ROUND-4 FIX: amounts are decimal STRINGS in replies. ***
+        return {"side": "sell",
+                "client_id": self.next_client_id(),
+                "symbol": SYMBOL,
+                "qty": str(qty),
+                "max_slippage_bps": MAX_SLIPPAGE_BPS}
+
+    def decide(self, seq, close, held_qty, held_cost):
+        """Return the order list for this batch (possibly empty)."""
+        if self.warmup_bars > 0 and seq < self.warmup_bars:
+            return []
+        if close is None:
+            return []
+
+        if held_qty > 0:
+            # Holding: track the open trade, exit on any trigger.
+            if self.awaiting_fill or self.entry is None:
+                self.entry = self.fill_price(held_qty, held_cost)
+                self.peak = close
+                self.entry_seq = seq
+                self.awaiting_fill = False
+                self.buy_sent_seq = None
+            if close > self.peak:
+                self.peak = close
+            take_profit = close * 10000 >= self.entry * TAKE_PROFIT_BPS
+            stop_loss = close * 10000 <= self.entry * STOP_LOSS_BPS
+            trailing = (self.peak * 10000 >= self.entry * TRAIL_ARM_BPS
+                        and close * 10000 <= self.peak * TRAIL_GIVEBACK_BPS)
+            max_hold = seq - self.entry_seq >= MAX_HOLD_BARS
+            if take_profit or stop_loss or trailing or max_hold:
+                self.last_exit_seq = seq
+                self.entry = None
+                self.peak = None
+                self.awaiting_fill = False
+                self.buy_sent_seq = None
+                return [self.sell_order(held_qty)]
+            return []
+
+        # Not holding: clear any stale trade tracking.
+        self.entry = None
+        self.peak = None
+        if self.awaiting_fill:
+            if (self.buy_sent_seq is not None
+                    and seq - self.buy_sent_seq >= MISSED_FILL_BARS):
+                # Fill never showed up: treat the buy as missed.
+                self.awaiting_fill = False
+                self.buy_sent_seq = None
+            else:
+                # Fill may still land next bar; wait, do not double-buy.
+                return []
+        if len(self.closes) <= LOOKBACK:
+            return []
+        if seq - self.last_exit_seq < COOLDOWN_BARS:
+            return []
+        trailing_high = max(self.closes[-LOOKBACK - 1:-1])
+        previous_close = self.closes[-2]
+        dipped = close * 10000 <= trailing_high * DIP_BPS
+        bounced = close > previous_close
+        if not (dipped and bounced):
+            return []
+        notional = self.cash
+        room = self.weight_room(SYMBOL)
+        if room < notional:
+            notional = room
+        if notional <= 0:
+            # Zero cash or zero weight room: a zero-notional buy would be
+            # a protocol violation, so stand aside instead of ordering.
+            return []
+        if notional < self.min_notional:
+            return []
+        self.entry = close
+        self.peak = close
+        self.entry_seq = seq
+        self.awaiting_fill = True
+        self.buy_sent_seq = seq
+        return [self.buy_order(notional)]
+
+
+def run():
+    bot = None
     expected_seq = 0
     batches_seen = 0
-    order_counter = 0
-
-    cash = 0
-    equity = 0
-    positions = {}
-    closes = []
-
-    entry = None
-    peak = None
-    entry_seq = None
-    last_exit_seq = -1000000000
-    awaiting_fill = False
-
+    done_seen = False
     out = sys.stdout
 
     for raw_line in sys.stdin:
-        if raw_line.strip() == "":
+        line = raw_line.strip()
+        if not line:
             continue
         try:
-            message = json.loads(raw_line)
+            message = json.loads(line)
         except ValueError:
-            fail("input line is not valid JSON")
+            fail("line is not valid JSON")
         if not isinstance(message, dict):
-            fail("input line must be a JSON object")
-        msg_type = message.get("type")
+            fail("message is not a JSON object")
+        kind = message.get("type")
 
-        if not hello_seen:
-            if msg_type != "hello":
-                fail("first message must be hello")
+        if kind == "hello":
+            if bot is not None:
+                fail("second hello")
             if message.get("protocol") != PROTOCOL:
-                fail("protocol must be agent-fun/bars-replay/v1")
-            capital = message.get("capital")
-            if not isinstance(capital, dict):
-                fail("hello capital must be an object")
-            if "quote_units" not in capital or "quote_scale" not in capital:
-                fail("hello capital is missing quote_units or quote_scale")
-            to_u64(capital["quote_units"])
-            quote_scale = to_scale(capital["quote_scale"], "quote_scale")
-            raw_symbols = message.get("symbols")
-            if not isinstance(raw_symbols, list) or not raw_symbols:
-                fail("hello symbols must be a non-empty list")
-            scales = {}
-            for item in raw_symbols:
-                if not isinstance(item, dict):
-                    fail("hello symbol must be an object")
-                if "symbol" not in item:
-                    fail("hello symbol is missing symbol")
-                if "qty_scale" not in item or "price_scale" not in item:
-                    fail("hello symbol is missing a scale")
-                symbol = check_symbol(item["symbol"])
-                scales[symbol] = (
-                    to_scale(item["qty_scale"], "qty_scale"),
-                    to_scale(item["price_scale"], "price_scale"),
-                )
-            if SYMBOL not in scales:
-                fail("hello symbols must include CBBTC")
-            qty_scale, price_scale = scales[SYMBOL]
-            caps = message.get("caps")
-            if not isinstance(caps, dict):
-                fail("hello caps must be an object")
-            if "max_orders_per_bar" not in caps or "max_weight_bps" not in caps:
-                fail("hello caps is missing a field")
-            max_orders_per_bar = to_u64(caps["max_orders_per_bar"])
-            max_weight_bps = to_u64(caps["max_weight_bps"])
-            fees = message.get("fees")
-            if not isinstance(fees, dict):
-                fail("hello fees must be an object")
-            if "min_notional_quote_units" not in fees:
-                fail("hello fees is missing min_notional_quote_units")
-            min_notional = to_u64(fees["min_notional_quote_units"])
-            if "warmup_bars" in message and message["warmup_bars"] is not None:
-                warmup_bars = to_u64(message["warmup_bars"])
-            else:
-                warmup_bars = 0
-            hello_seen = True
+                fail("bad protocol %r" % (message.get("protocol"),))
+            bot = Bot(message)
             continue
 
-        if msg_type == "hello":
-            fail("second hello is a protocol error")
-        if msg_type == "done":
-            if "seq" not in message:
-                fail("done is missing seq")
-            done_seq = to_u64(message["seq"])
-            if done_seq != batches_seen:
-                fail("done seq must equal the number of batches seen")
-            if "account" not in message:
-                fail("done is missing account")
-            parse_account(message["account"])
+        if bot is None:
+            fail("first message is not hello")
+
+        if kind == "batch":
+            seq = to_u64(message.get("seq"), "batch.seq")
+            if seq != expected_seq:
+                fail("batch seq %d, expected %d" % (seq, expected_seq))
+            to_u64(message.get("t"), "batch.t")
+            bars = message.get("bars")
+            if not isinstance(bars, list):
+                fail("batch.bars is not a list")
+            fills = message.get("fills")
+            if fills is not None and not isinstance(fills, list):
+                fail("batch.fills is not a list")
+            cash, equity, positions = check_account(
+                message.get("account"), "batch.account")
+            bot.cash = cash
+            bot.equity = equity
+            bot.held_qty = 0
+            bot.held_cost = 0
+            for symbol, qty, cost in positions:
+                if symbol == SYMBOL:
+                    bot.held_qty = qty
+                    bot.held_cost = cost
+
+            close = None
+            for bar in bars:
+                if not isinstance(bar, dict):
+                    fail("batch.bars entry is not an object")
+                symbol = check_symbol(bar.get("symbol"), "batch.bars.symbol")
+                to_u64(bar.get("t"), "batch.bars.t")
+                to_u64(bar.get("o"), "batch.bars.o")
+                to_u64(bar.get("h"), "batch.bars.h")
+                to_u64(bar.get("l"), "batch.bars.l")
+                bar_close = to_u64(bar.get("c"), "batch.bars.c")
+                volume = bar.get("v")
+                if volume is not None:
+                    to_u64(volume, "batch.bars.v")
+                # Depth fields (o_depth / c_depth) are ignored entirely.
+                bot.latest_close[symbol] = bar_close
+                if symbol == SYMBOL:
+                    close = bar_close
+            if close is not None:
+                bot.closes.append(close)
+
+            orders = bot.decide(seq, close, bot.held_qty, bot.held_cost)
+            if len(orders) > bot.max_orders_per_bar:
+                fail("too many orders for one bar")
+            for order in orders:
+                check_symbol(order["symbol"], "reply order symbol")
+                check_client_id(order["client_id"])
+                to_plain_int(order["max_slippage_bps"],
+                             "reply max_slippage_bps", 0, 10000)
+                amount = (order.get("notional_quote_units")
+                          if order["side"] == "buy" else order.get("qty"))
+                if not isinstance(amount, str):
+                    fail("reply amount is not a decimal string")
+                to_u64(amount, "reply order amount")
+            reply = json.dumps({"type": "reply", "seq": seq, "orders": orders},
+                               separators=(",", ":"))
+            if len(reply.encode("utf-8")) >= 65536:
+                fail("reply exceeds 64 KiB")
+            out.write(reply + "\n")
+            out.flush()
+            expected_seq += 1
+            batches_seen += 1
+            continue
+
+        if kind == "done":
+            seq = to_u64(message.get("seq"), "done.seq")
+            if seq != batches_seen:
+                fail("done seq %d, batches seen %d" % (seq, batches_seen))
+            if not isinstance(message.get("reason"), str):
+                fail("done.reason is not a string")
+            check_account(message.get("account"), "done.account")
             done_seen = True
             break
-        if msg_type != "batch":
-            fail("unknown message type")
 
-        if "seq" not in message or "t" not in message:
-            fail("batch is missing seq or t")
-        seq = to_u64(message["seq"])
-        to_u64(message["t"])
-        if seq != expected_seq:
-            fail("batch seq is not the expected next seq")
-        raw_bars = message.get("bars")
-        if not isinstance(raw_bars, list):
-            fail("batch bars must be a list")
-        fills = message.get("fills", [])
-        if not isinstance(fills, list):
-            fail("batch fills must be a list")
-        if "account" not in message:
-            fail("batch is missing account")
-        cash, equity, positions = parse_account(message["account"])
+        fail("unknown message type %r" % (kind,))
 
-        close = None
-        for bar in raw_bars:
-            if not isinstance(bar, dict):
-                fail("bar must be an object")
-            if "symbol" not in bar:
-                fail("bar is missing symbol")
-            if "o" not in bar or "h" not in bar:
-                fail("bar is missing o or h")
-            if "l" not in bar or "c" not in bar:
-                fail("bar is missing l or c")
-            bar_symbol = check_symbol(bar["symbol"])
-            to_u64(bar["o"])
-            to_u64(bar["h"])
-            to_u64(bar["l"])
-            bar_close = to_u64(bar["c"])
-            # Depth fields (o_depth / c_depth) are ignored entirely.
-            if bar_symbol == SYMBOL:
-                # If a batch ever carried two bars for CBBTC, the
-                # last one is the latest close.
-                close = bar_close
-
-        if close is not None:
-            closes.append(close)
-
-        warming_up = warmup_bars > 0 and seq < warmup_bars
-        orders = []
-        # A zero order cap means no order may ever be sent; skip the
-        # trading logic entirely so no exit or buy is recorded for an
-        # order that can never leave this process.
-        if not warming_up and close is not None and max_orders_per_bar > 0:
-            held = positions.get(SYMBOL, (0, 0))
-            held_qty, held_cost = held
-            if held_qty > 0:
-                if awaiting_fill or entry is None:
-                    if held_cost > 0:
-                        fill_price = (
-                            held_cost
-                            * 10 ** (qty_scale + price_scale)
-                            // (held_qty * 10 ** quote_scale)
-                        )
-                    else:
-                        fill_price = close
-                    entry = fill_price
-                    peak = close
-                    entry_seq = seq
-                    awaiting_fill = False
-                if entry is None:
-                    entry = close
-                    peak = close
-                    entry_seq = seq
-                if peak is None:
-                    peak = close
-                elif close > peak:
-                    peak = close
-                if entry_seq is None:
-                    entry_seq = seq
-                take_profit = close * 10000 >= entry * TAKE_PROFIT_BPS
-                stop_loss = close * 10000 <= entry * STOP_LOSS_BPS
-                trailing = (
-                    peak * 10000 >= entry * TRAIL_ARM_BPS
-                    and close * 10000 <= peak * TRAIL_GIVEBACK_BPS
-                )
-                max_hold = seq - entry_seq >= MAX_HOLD_BARS
-                if take_profit or stop_loss or trailing or max_hold:
-                    order_counter += 1
-                    client_id = "o" + str(order_counter)
-                    if CLIENT_RE.fullmatch(client_id) is None:
-                        fail("generated client_id is invalid")
-                    orders = [
-                        {
-                            "side": "sell",
-                            "client_id": client_id,
-                            "symbol": SYMBOL,
-                            "qty": held_qty,
-                            "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                        }
-                    ]
-                    last_exit_seq = seq
-                    entry = None
-                    peak = None
-                    entry_seq = None
-                    awaiting_fill = False
-            else:
-                entry = None
-                peak = None
-                if awaiting_fill:
-                    # The buy was sent but no fill has shown up yet; do
-                    # not stack a second buy on the next bar. If the
-                    # fill still has not appeared two bars after the
-                    # buy, treat it as missed and allow a fresh buy.
-                    if entry_seq is not None and seq - entry_seq >= 2:
-                        awaiting_fill = False
-                    else:
-                        orders = []
-                        awaiting_fill = True
-                if not awaiting_fill:
-                    if len(closes) > LOOKBACK and seq - last_exit_seq >= COOLDOWN_BARS:
-                        previous_close = closes[-2]
-                        trailing_high = max(closes[-151:-1])
-                        dip = close * 10000 <= trailing_high * DIP_BPS
-                        bounce = close > previous_close
-                        if dip and bounce:
-                            # Held qty is 0 on this branch, so this is 0;
-                            # use the shared formula instead of a magic
-                            # constant so the weight room stays correct
-                            # if this branch ever sees a residual position.
-                            held_value = position_value(
-                                held_qty, close, quote_scale, qty_scale, price_scale
-                            )
-                            weight_room = (
-                                max_weight_bps * equity // 10000 - held_value
-                            )
-                            if weight_room < 0:
-                                weight_room = 0
-                            notional = cash if cash < weight_room else weight_room
-                            if notional >= min_notional and notional > 0:
-                                order_counter += 1
-                                client_id = "o" + str(order_counter)
-                                if CLIENT_RE.fullmatch(client_id) is None:
-                                    fail("generated client_id is invalid")
-                                orders = [
-                                    {
-                                        "side": "buy",
-                                        "client_id": client_id,
-                                        "symbol": SYMBOL,
-                                        "notional_quote_units": notional,
-                                        "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                                    }
-                                ]
-                                entry = close
-                                peak = close
-                                entry_seq = seq
-                                awaiting_fill = True
-                # Keep entry_seq from the buy (used by the missed-fill
-                # timeout above); entry/peak are rebuilt from the true
-                # fill price once the position appears.
-
-        if len(orders) > max_orders_per_bar:
-            orders = []
-        reply = {"type": "reply", "seq": seq, "orders": orders}
-        out.write(json.dumps(reply, separators=(",", ":")) + "\n")
-        out.flush()
-        expected_seq += 1
-        batches_seen += 1
-
-    if not hello_seen:
-        fail("no hello received")
     if not done_seen:
         fail("EOF without done")
+
+
+def main():
+    try:
+        run()
+    except Fatal as exc:
+        sys.stderr.write("fatal: %s\n" % (exc,))
+        return 1
     return 0
 
 
